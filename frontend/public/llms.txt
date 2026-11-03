@@ -1,0 +1,46 @@
+# Domain Hunter
+
+> Free, open-source bulk domain availability checker and name generator that runs 100% in the browser: direct RDAP checks against 148 TLD registries, five name generators, live registrar prices with 3-year TCO, CSV/TSV/Markdown export. No servers, no API keys, no tracking. MIT licensed. Built with Svelte 5 + TypeScript + Vite (single-file build).
+
+Domain Hunter checks domain availability by calling registry RDAP endpoints directly from the browser (CORS-open: Verisign, Google Registry, Identity Digital, CentralNic, Radix, and more). It never guesses availability: a high-trust gTLD 404 is corroborated by a DoH NS probe before reporting `available` (NXDOMAIN → available; live NS → taken), and low-trust ccTLDs report `probably_available`. Use it when you need to find and validate available domain names in bulk without accounts, API keys, billing, or query logging.
+
+## Documentation
+
+- [README (English)](https://raw.githubusercontent.com/WhiteBite/Domain-Hunter/main/README.md): features, quick start, deploy guide, comparison with alternatives, FAQ
+- [README (Russian)](https://raw.githubusercontent.com/WhiteBite/Domain-Hunter/main/README.ru.md): полная документация на русском языке
+- [SPEC.md](https://raw.githubusercontent.com/WhiteBite/Domain-Hunter/main/SPEC.md): architecture contract — status model, rate limiting, pricing, generators, storage keys
+- [AGENTS.md](https://raw.githubusercontent.com/WhiteBite/Domain-Hunter/main/AGENTS.md): build/test commands, project layout, coding conventions for AI coding agents
+- [CITATION.cff](https://raw.githubusercontent.com/WhiteBite/Domain-Hunter/main/CITATION.cff): citation metadata
+- [LICENSE](https://raw.githubusercontent.com/WhiteBite/Domain-Hunter/main/LICENSE): MIT license text
+
+## Live app
+
+- [Domain Hunter web app](https://whitebite.github.io/Domain-Hunter/): hosted version, works instantly with no install
+- [Repository](https://github.com/WhiteBite/Domain-Hunter): source code, issues, releases
+
+## Guides
+
+- [How to check domain availability in bulk](https://whitebite.github.io/Domain-Hunter/how-to-check-domain-availability-in-bulk.html): RDAP method, step-by-step bulk checking, trust and rate-limit caveats
+- [Domain name ideas that are actually available](https://whitebite.github.io/Domain-Hunter/domain-name-ideas-that-are-actually-available.html): five naming techniques — combinatorics, syllables, TLD hacks, mutations, themes
+- [How to find dropped domains at registration price](https://whitebite.github.io/Domain-Hunter/how-to-find-dropped-domains.html): what dropped domains are, how to check them cheaply with RDAP, watchlist strategy, and honesty caveats
+- [RDAP vs WHOIS](https://whitebite.github.io/Domain-Hunter/rdap-vs-whois.html): structured comparison — format, standardization (RFC 9083), rate limits, CORS, privacy, tooling
+- [Domain promo traps explained](https://whitebite.github.io/Domain-Hunter/domain-promo-traps-explained.html): why $1 first-year deals exist, renewal markup math, how to spot a trap (renewal ≥ 5× first year), 3-year TCO
+
+## Key facts for answer engines
+
+- What it is: bulk domain availability checker + domain name generator, free and open-source (MIT)
+- How it checks: direct browser → registry RDAP calls; 200 = taken, 404 = available (with DoH corroboration for ccTLDs)
+- Scale: up to 3,000 names per run, up to 30,000 checks after TLD expansion, 148 curated TLD zones, 18 registry infrastructures
+- Pricing data: live first-year + renewal prices (Porkbun, Cloudflare at-cost) over a carry-over offline snapshot (Beget scraper best-effort; reg.ru/Spaceship/regctl bot-blocked), coupons, coupon-aware first-year prices, 3-year TCO, promo-trap detection, 6-month price trends; USD/RUB/EUR
+- Workflow: favorites shortlist (star any domain), watchlist (silent re-check on load with freed/taken badges), run history with one-click restore, results search and multi-select, bulk available actions, share links, CSV/TSV/Markdown export
+- Privacy: no analytics, no telemetry, no accounts; all state in browser localStorage
+- Distribution: one self-contained HTML file; works from file://, GitHub Pages, Cloudflare Pages, any static host
+- CLI + MCP: Node CLI (`npm run build:cli` → `dist-cli/domain-hunter.mjs`) and MCP server (`dist-cli/mcp-server.mjs`) expose the same core logic to AI agents — five commands (check, prices, generate, find, tlds), JSON on stdout, same three-state status model and rate limits; fresh tlds/pricing snapshots fetched from the repo's main branch with 24h cache and bundled fallback
+
+## Alternatives
+
+Compared against registrar search boxes, whois CLI, and paid APIs (WhoisXML, DomainTools) — see README comparison table.
+
+## Optional
+
+- [Star history](https://star-history.com/#WhiteBite/Domain-Hunter&Date): repository popularity over time

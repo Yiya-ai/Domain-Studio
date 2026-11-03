@@ -1,0 +1,618 @@
+<script lang="ts">
+  import { onMount } from 'svelte';
+  import { get } from 'svelte/store';
+  import { locale, t, LOCALES, detectLocale } from './i18n';
+  import { activeTab, settings, registry, type TabId } from './ui/store';
+  import { KEYS, loadSettings, saveSettings } from './ui/settings';
+  import { applyTheme, watchSystemTheme } from './ui/theme';
+  import { trapFocus } from './ui/focustrap';
+  import { popover } from './ui/popover';
+  import { favorites } from './ui/favorites';
+  import { refreshWatchlist } from './ui/watchlist';
+  import { fetchBootstrap, mergeWithCurated } from './core/bootstrap';
+  import type { Locale, Settings } from './types';
+  import Flag from './ui/components/Flag.svelte';
+  import './ui/tokens.css';
+  import './ui/chrome.css';
+  import CheckTab from './ui/components/CheckTab.svelte';
+  import GeneratorsTab from './ui/components/GeneratorsTab.svelte';
+  import DropsTab from './ui/components/DropsTab.svelte';
+  import PricesTab from './ui/components/PricesTab.svelte';
+  import SocialTab from './ui/components/SocialTab.svelte';
+  import SettingsTab from './ui/components/SettingsTab.svelte';
+  import AboutTab from './ui/components/AboutTab.svelte';
+  import ServerTab from './ui/components/ServerTab.svelte';
+  import IconChevron from './ui/components/icons/IconChevron.svelte';
+  import IconCheck from './ui/components/icons/IconCheck.svelte';
+
+  // First visit (no saved settings): honor the browser language. Afterwards
+  // the stored preference wins, so a manual choice is never overridden.
+  function loadInitialSettings(): Settings {
+    const s = loadSettings();
+    let hadSaved = false;
+    try {
+      hadSaved = localStorage.getItem(KEYS.settings) !== null;
+    } catch {
+      hadSaved = true;
+    }
+    if (!hadSaved) s.lang = detectLocale();
+    return s;
+  }
+
+  settings.set(loadInitialSettings());
+  let current = $state($settings);
+  settings.subscribe((value) => {
+    current = value;
+    applyTheme(value.theme);
+    locale.set(value.lang);
+    saveSettings(value);
+  });
+
+  let tab = $state<TabId>('check');
+  activeTab.subscribe((value) => (tab = value));
+
+  // Reset scroll on tab switch: each tab starts at the top, never at the
+  // previous tab's scroll depth.
+  $effect(() => {
+    void tab;
+    window.scrollTo({ top: 0 });
+  });
+
+  // Tab bar right-edge fade: shown only while the bar overflows AND there is
+  // still content to the right (hides once scrolled to the end).
+  let tabsEl: HTMLElement | null = $state(null);
+  let tabsScrollable = $state(false);
+  $effect(() => {
+    const el = tabsEl;
+    // Label lengths change with the locale — re-check on language switch.
+    void current.lang;
+    if (!el) return;
+    const check = (): void => {
+      const overflowing = el.scrollWidth > el.clientWidth + 1;
+      const atEnd = el.scrollLeft + el.clientWidth >= el.scrollWidth - 1;
+      tabsScrollable = overflowing && !atEnd;
+    };
+    check();
+    el.addEventListener('scroll', check, { passive: true });
+    const ro = new ResizeObserver(check);
+    ro.observe(el);
+    return () => {
+      el.removeEventListener('scroll', check);
+      ro.disconnect();
+    };
+  });
+
+  // Keep the active tab visible in the strip when tabs overflow (mobile).
+  $effect(() => {
+    void tab;
+    const el = tabsEl;
+    if (!el) return;
+    const active = el.querySelector<HTMLButtonElement>('.tab.active');
+    active?.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+  });
+
+  // Work tabs (check/generators/drops) use the wider content cap so the
+  // two-pane workspace has room; text tabs (social/settings/about) stay narrow.
+  const wideTabs: ReadonlySet<TabId> = new Set(['check', 'generators', 'drops', 'prices']);
+  let isWide = $derived(wideTabs.has(tab));
+
+  const tabs: { id: TabId; labelKey: string }[] = [
+    { id: 'check', labelKey: 'tab.check' },
+    { id: 'generators', labelKey: 'tab.generators' },
+    { id: 'drops', labelKey: 'tab.drops' },
+    { id: 'prices', labelKey: 'tab.prices' },
+    { id: 'social', labelKey: 'tab.social' },
+    { id: 'server', labelKey: 'tab.server' },
+    { id: 'settings', labelKey: 'tab.settings' },
+    { id: 'about', labelKey: 'tab.about' },
+  ];
+
+  /** Accessible label for the currently-active tab panel. */
+  const currentTabLabel = $derived(tabs.find((td) => td.id === tab)?.labelKey ?? '');
+
+  function selectTab(id: TabId) {
+    activeTab.set(id);
+  }
+
+  function toggleTheme() {
+    const isDark = document.documentElement.dataset.theme === 'dark';
+    settings.update((s) => ({ ...s, theme: isDark ? 'light' : 'dark' }));
+  }
+
+  // Language dropdown (replaces the old cycle-on-click button: with 5
+  // locales, cycling was painful — the menu lists all locales at once).
+  let langMenuOpen = $state(false);
+  let langToggleEl: HTMLButtonElement | null = $state(null);
+
+  function toggleLangMenu() {
+    langMenuOpen = !langMenuOpen;
+  }
+
+  function closeLangMenu(refocus: boolean) {
+    if (!langMenuOpen) return;
+    langMenuOpen = false;
+    if (refocus) langToggleEl?.focus();
+  }
+
+  function selectLang(code: Locale) {
+    settings.update((s) => ({ ...s, lang: code }));
+    closeLangMenu(true);
+  }
+
+  let watchlistTriggered = false;
+
+  onMount(() => {
+    // Silently re-check favorited domains on load (SPEC §5 dh:v1:watch).
+    // Guarded by a module-level flag so HMR/strict-mode double mount doesn't
+    // double-run. Only fires when favorites are non-empty and the registry
+    // store is ready (it is seeded at module init from tlds.json).
+    if (!watchlistTriggered) {
+      watchlistTriggered = true;
+      if (get(favorites).size > 0) {
+        void refreshWatchlist();
+      }
+    }
+
+    // IANA bootstrap auto-discovery (SPEC §6): idle-scheduled so it never
+    // blocks first paint. fetchBootstrap caches internally (24h TTL); merge
+    // with the curated registry (curated zones always win on conflict).
+    // Errors are non-fatal — the curated registry stays in place.
+    const runBootstrap = (): void => {
+      void (async () => {
+        try {
+          const json = await fetchBootstrap();
+          if (json == null) return;
+          registry.set(mergeWithCurated(get(registry), json));
+        } catch (err) {
+          console.warn('bootstrap discovery failed', err);
+        }
+      })();
+    };
+    const ric = (
+      window as Window & {
+        requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+      }
+    ).requestIdleCallback;
+    if (typeof ric === 'function') {
+      ric(runBootstrap, { timeout: 2000 });
+    } else {
+      setTimeout(runBootstrap, 500);
+    }
+
+    return watchSystemTheme(() => $settings.theme);
+  });
+
+  $effect(() => {
+    document.title = t('app.title.html');
+  });
+</script>
+
+<a class="skip-link" href="#main-content" data-testid="app-skip-link">{t('a11y.skip')}</a>
+<h1 class="visually-hidden">{t('app.name')}</h1>
+<div class="shell" class:wide={isWide} data-testid="app-shell">
+  <header class="header">
+    <div class="header-inner">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+          <circle cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="3" />
+          <circle cx="16" cy="16" r="4" fill="currentColor" />
+        </svg>
+        <div class="brand-text">
+          <strong>{t('app.name')}</strong>
+          <span class="tagline">{t('app.tagline')}</span>
+        </div>
+      </div>
+      <div class="header-actions">
+        <div class="lang-wrap" use:popover={{ open: langMenuOpen, onClose: () => closeLangMenu(false), triggerEl: langToggleEl }}>
+          <button
+            class="icon-btn"
+            class:active={langMenuOpen}
+            bind:this={langToggleEl}
+            onclick={toggleLangMenu}
+            aria-label={t('app.language.aria')}
+            title={t('app.language.aria')}
+            aria-haspopup="menu"
+            aria-expanded={langMenuOpen}
+            data-testid="app-lang-toggle"
+          >
+            <Flag code={current.lang} size={18} />
+            <span class="lang-code">{current.lang.toUpperCase()}</span>
+            <IconChevron class={'lang-chevron' + (langMenuOpen ? ' rot' : '')} />
+          </button>
+          {#if langMenuOpen}
+            <div class="lang-menu" role="menu" aria-label={t('app.language.aria')} use:trapFocus>
+              {#each LOCALES as loc (loc.code)}
+                <button
+                  class="lang-item"
+                  class:current={current.lang === loc.code}
+                  type="button"
+                  role="menuitem"
+                  aria-current={current.lang === loc.code ? 'true' : undefined}
+                  onclick={() => selectLang(loc.code)}
+                  data-testid={`app-lang-${loc.code}`}
+                >
+                  <span class="lang-check" aria-hidden="true">
+                    {#if current.lang === loc.code}
+                      <IconCheck />
+                    {/if}
+                  </span>
+                  <Flag code={loc.code} size={18} />
+                  <span class="lang-native">{loc.nativeName}</span>
+                  <span class="lang-item-code nums">{loc.code.toUpperCase()}</span>
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+        <button class="icon-btn" onclick={toggleTheme} aria-label={t('theme.label')} title={t('theme.label')} data-testid="app-theme-toggle">
+          <svg class="theme-icon icon-moon" viewBox="0 0 16 16" aria-hidden="true">
+            <path
+              d="M13.2 9.6A5.8 5.8 0 0 1 6.4 2.8a5.8 5.8 0 1 0 6.8 6.8Z"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linejoin="round"
+            />
+          </svg>
+          <svg class="theme-icon icon-sun" viewBox="0 0 16 16" aria-hidden="true">
+            <circle cx="8" cy="8" r="2.8" fill="none" stroke="currentColor" stroke-width="1.5" />
+            <path
+              d="M8 1.6v1.8M8 12.6v1.8M1.6 8h1.8M12.6 8h1.8M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+            />
+          </svg>
+        </button>
+      </div>
+    </div>
+    <!-- svelte-ignore a11y_no_noninteractive_element_to_interactive_role -->
+    <nav class="tabs" class:fade={tabsScrollable} role="tablist" aria-label={t('app.name')} bind:this={tabsEl}>
+      {#each tabs as tabDef (tabDef.id)}
+        <button
+          role="tab"
+          type="button"
+          class="tab"
+          class:active={tab === tabDef.id}
+          aria-selected={tab === tabDef.id}
+          aria-controls={`panel-${tabDef.id}`}
+          onclick={() => selectTab(tabDef.id)}
+          data-testid={`app-tab-${tabDef.id}`}
+        >
+          {t(tabDef.labelKey)}
+        </button>
+      {/each}
+    </nav>
+  </header>
+
+  <main class="content" id="main-content" tabindex="-1">
+    <div id={`panel-${tab}`} role="tabpanel" aria-label={t(currentTabLabel)}>
+      {#if tab === 'check'}
+        <CheckTab />
+      {:else if tab === 'generators'}
+        <GeneratorsTab />
+      {:else if tab === 'drops'}
+        <DropsTab />
+      {:else if tab === 'prices'}
+        <PricesTab />
+      {:else if tab === 'social'}
+        <SocialTab />
+      {:else if tab === 'server'}
+        <ServerTab />
+      {:else if tab === 'settings'}
+        <SettingsTab />
+      {:else}
+        <AboutTab />
+      {/if}
+    </div>
+  </main>
+
+  <footer class="footer">
+    <span>{t('footer.note')}</span>
+    <a href="https://github.com/WhiteBite/Domain-Hunter" target="_blank" rel="noopener noreferrer" data-testid="app-footer-github">
+      GitHub
+    </a>
+  </footer>
+</div>
+
+<style>
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .skip-link {
+    position: absolute;
+    left: -9999px;
+    top: 0;
+    z-index: 100;
+    background: var(--accent);
+    color: var(--on-accent);
+    padding: var(--space-2) var(--space-4);
+    border-radius: 0 0 var(--radius-md) 0;
+    font-size: var(--text-sm);
+  }
+
+  .skip-link:focus {
+    left: 0;
+  }
+
+  .shell {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .header {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: color-mix(in srgb, var(--bg-elevated) 88%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .header-inner {
+    max-width: var(--content-max);
+    margin: 0 auto;
+    padding: var(--space-3) var(--space-4);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-4);
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    color: var(--accent);
+  }
+
+  .brand-mark {
+    width: 28px;
+    height: 28px;
+    flex: none;
+  }
+
+  .brand-text {
+    display: flex;
+    flex-direction: column;
+    line-height: 1.2;
+  }
+
+  .brand-text strong {
+    color: var(--text);
+    font-size: var(--text-base);
+  }
+
+  .tagline {
+    color: var(--text-tertiary);
+    font-size: var(--text-xs);
+  }
+
+  .header-actions {
+    display: flex;
+    gap: var(--space-2);
+  }
+
+  .icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-1);
+    border: 1px solid var(--border);
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    border-radius: var(--radius-md);
+    min-width: 40px;
+    min-height: 36px;
+    padding: 0 var(--space-3);
+    cursor: pointer;
+    font-size: var(--text-sm);
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+  }
+
+  .icon-btn:hover {
+    background: var(--bg-sunken);
+    color: var(--text);
+  }
+
+  .icon-btn.active {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--accent-soft);
+  }
+
+  /* Language dropdown — trigger + popover listing all locales. */
+  .lang-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+
+  .icon-btn .lang-code {
+    font-weight: 500;
+  }
+
+  :global(.lang-chevron) {
+    width: 12px;
+    height: 12px;
+    display: block;
+    transition: transform var(--dur) var(--ease);
+  }
+
+  :global(.lang-chevron.rot) {
+    transform: rotate(180deg);
+  }
+
+  .lang-menu {
+    position: absolute;
+    top: calc(100% + var(--space-1));
+    right: 0;
+    min-width: 180px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: var(--space-2);
+    border: 1px solid var(--border);
+    background: var(--bg-elevated);
+    border-radius: 8px;
+    box-shadow: var(--shadow-pop);
+    z-index: 100;
+  }
+
+  .lang-item {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-2);
+    border: none;
+    background: transparent;
+    color: var(--text);
+    border-radius: var(--radius-sm);
+    font-size: var(--text-sm);
+    cursor: pointer;
+    text-align: left;
+    min-height: 32px;
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+  }
+
+  .lang-item:hover {
+    background: var(--bg-sunken);
+  }
+
+  .lang-item.current {
+    color: var(--accent);
+  }
+
+  .lang-check {
+    width: 16px;
+    height: 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+  }
+
+  .lang-check :global(svg) {
+    width: 14px;
+    height: 14px;
+  }
+
+  .lang-native {
+    flex: 1;
+  }
+
+  .lang-item-code {
+    color: var(--text-tertiary);
+    font-size: var(--text-xs);
+  }
+
+  .lang-item.current .lang-item-code {
+    color: var(--accent);
+    opacity: 0.8;
+  }
+
+  .theme-icon {
+    width: 16px;
+    height: 16px;
+    display: block;
+  }
+
+  .icon-sun {
+    display: none;
+  }
+
+  :global([data-theme='dark']) .icon-sun {
+    display: block;
+  }
+
+  :global([data-theme='dark']) .icon-moon {
+    display: none;
+  }
+
+  .tabs {
+    max-width: var(--content-max);
+    margin: 0 auto;
+    padding: 0 var(--space-4);
+    display: flex;
+    gap: var(--space-1);
+    overflow-x: auto;
+    /* The right-edge fade hints at scrollability — a native scrollbar would
+       double-signal (and eat vertical space on mobile). */
+    scrollbar-width: none;
+  }
+
+  .tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* Right-edge fade hints at more tabs off-canvas (mobile). Applied only
+     while the bar overflows (tabsScrollable). */
+  .tabs.fade {
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 48px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 48px), transparent);
+  }
+
+  .tab {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    padding: var(--space-2) var(--space-3);
+    font-size: var(--text-sm);
+    font-weight: 500;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    white-space: nowrap;
+    transition: color var(--dur) var(--ease);
+  }
+
+  .tab:hover {
+    color: var(--text);
+  }
+
+  .tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
+  .content {
+    flex: 1;
+    width: 100%;
+    max-width: var(--content-max);
+    margin: 0 auto;
+    padding: var(--space-5) var(--space-4) var(--space-7);
+  }
+
+  /* Work tabs widen the content cap and align the header/tab bar to it. */
+  .shell.wide .header-inner,
+  .shell.wide .tabs,
+  .shell.wide .content {
+    max-width: var(--content-max-wide);
+  }
+
+  .footer {
+    border-top: 1px solid var(--border);
+    padding: var(--space-4);
+    display: flex;
+    justify-content: center;
+    gap: var(--space-4);
+    color: var(--text-tertiary);
+    font-size: var(--text-xs);
+  }
+
+  @media (max-width: 640px) {
+    .tagline {
+      display: none;
+    }
+  }
+</style>

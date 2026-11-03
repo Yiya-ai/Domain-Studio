@@ -1,0 +1,1948 @@
+<script lang="ts">
+  import { get } from 'svelte/store';
+  import { onMount, onDestroy } from 'svelte';
+  import { results, settings, pricing, registry, runState, exportRows, requestFavoritesView, sharedView, loadResultsView, saveResultsView, type ResultsView } from '../store';
+  import type { CheckResult, EngineOptions, PriceEntry, RegistrarConfig } from '../../types';
+  import {
+    bestEntry,
+    formatPrice,
+    priceTier,
+    isBelowFloor,
+    isPromoTrap,
+    bestCoupon,
+    tco3,
+    couponDiscountCents,
+    bestRenewal,
+    couponEffectivePrice,
+    premiumLikely,
+  } from '../../pricing/pricing';
+  import { createEngine } from '../../core/engine';
+  import type { EngineHandle } from '../../core/engine';
+  import { put as putCache } from '../../core/cache';
+  import { t } from '../../i18n';
+  import { favorites, toggleFavorite } from '../favorites';
+  import { watchChanges, watchRunning, refreshWatchlist, classifyChange, notePrice } from '../watchlist';
+  import { copyText } from '../clipboard';
+  import { sanitizeId } from '../utils';
+  import { resultsToCsvRows, buildCsv, downloadCsv } from '../csv';
+  import { registrarMonogram } from '../registrar-badge';
+  import { applyAffiliate } from '../affiliate';
+  import { REGISTRAR_ICONS } from '../registrar-icons';
+  import { applyViewFilters, displayToUsdCents, type FilterKey } from '../table-filters';
+  import StatusBadge from './StatusBadge.svelte';
+  import Tooltip from './Tooltip.svelte';
+  import RowMenu from './RowMenu.svelte';
+  import AvailableMenu from './AvailableMenu.svelte';
+  import LegendPopover from './LegendPopover.svelte';
+  import DetailRow from './DetailRow.svelte';
+  import IconRefresh from './icons/IconRefresh.svelte';
+  import IconStar from './icons/IconStar.svelte';
+  import IconExternal from './icons/IconExternal.svelte';
+  import IconTag from './icons/IconTag.svelte';
+  import type { RegistrarQuote } from './DetailRow.svelte';
+  import { fetchPremiumDetail, isPremiumPriced, premiumOverrideCents } from '../dig';
+  import type { DigDetail } from '../dig';
+
+  import registrarsJson from '../../config/registrars.json';
+
+  const registrars = registrarsJson as unknown as RegistrarConfig[];
+
+  type SortKey = 'name' | 'price' | 'renew' | 'tco' | 'status';
+  type SortDir = 'asc' | 'desc';
+
+  let filter = $state<FilterKey>('all');
+  let sortKey = $state<SortKey>('name');
+  let sortDir = $state<SortDir>('asc');
+  let visibleCount = $state(100);
+  let copied = $state<Set<string>>(new Set());
+  let rechecking = $state<Set<string>>(new Set());
+  // Active per-row recheck engine handles. Tracked so unmount mid-recheck
+  // can terminate them (otherwise the workers leak until 'finished'). Capped
+  // at MAX_RECHECKS concurrent rechecks to stay polite to registries.
+  let recheckEngines = new Set<EngineHandle>();
+  const MAX_RECHECKS = 3;
+  let query = $state('');
+  let selected = $state<Set<string>>(new Set());
+  /** Budget filter input value (display currency). 0/empty = inactive. */
+  let budgetInput = $state('');
+  /** Budget in USD cents (converted from budgetInput via settings.rates).
+   *  0 = inactive. Recomputed in the filtered derived. */
+  let hideTraps = $state(false);
+  /** Renewal column semantics: 'best' = cheapest renewal across registrars;
+   *  'paired' = renewal at the same registrar as the displayed first-year
+   *  price. Persisted in dh:v1:resultsview. */
+  let pairMode = $state<'best' | 'paired'>('best');
+  /** True while restoring persisted/shared view — suppresses the
+   *  auto-tco-on-available $effect so it only fires on manual changes. */
+  let restoring = false;
+
+  // Row overflow menu: only one open at a time (keyed by domain).
+  let menuFor = $state<string | null>(null);
+
+  // Available-domains bulk actions: copied-flash state (menu is in AvailableMenu).
+  let availCopied = $state(false);
+  let availCopiedTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // Search input (focused by "/" shortcut).
+  let searchEl: HTMLInputElement | null = $state(null);
+
+  function onKeydown(e: KeyboardEvent): void {
+    // Ignore shortcuts when typing in a form control, composing (IME), or
+    // when a menu/detail popover is open (menuFor/detailFor set).
+    const target = e.target as HTMLElement | null;
+    const tag = target?.tagName.toLowerCase();
+    const inForm = tag === 'input' || tag === 'textarea' || tag === 'select';
+    const menuOpen = menuFor != null || detailFor != null;
+    if (e.isComposing || inForm || menuOpen) {
+      // "/" still works from the search box itself — but only if not in a
+      // different form control. Let the search input's own "/" pass.
+      if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey && tag !== 'input' && tag !== 'textarea' && tag !== 'select') {
+        // fall through to focus search
+      } else {
+        return;
+      }
+    }
+
+    // "/" focuses the results search.
+    if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      searchEl?.focus();
+      searchEl?.select();
+      return;
+    }
+
+    // Don't interfere with modifier combos (Ctrl+s, Cmd+s, etc.).
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+    // Digits 1-5 → switch filter.
+    if (e.key >= '1' && e.key <= '5') {
+      e.preventDefault();
+      const filters: FilterKey[] = ['all', 'available', 'taken', 'problems', 'favorites'];
+      const idx = parseInt(e.key, 10) - 1;
+      filter = filters[idx] ?? 'all';
+      return;
+    }
+
+    // 's' cycles sortKey: name → price → renew → tco → status → name.
+    if (e.key === 's' && !e.shiftKey) {
+      e.preventDefault();
+      const cycle: SortKey[] = ['name', 'price', 'renew', 'tco', 'status'];
+      const idx = cycle.indexOf(sortKey);
+      sortKey = cycle[(idx + 1) % cycle.length] ?? 'name';
+      return;
+    }
+
+    // 'S' (shift+s) toggles sort direction.
+    if ((e.key === 'S' || e.key === 's') && e.shiftKey) {
+      e.preventDefault();
+      sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+      return;
+    }
+  }
+
+  onMount(() => {
+    document.addEventListener('keydown', onKeydown);
+
+    // Restore persisted results view BEFORE first render where possible.
+    // The restoring flag suppresses the auto-tco-on-available $effect so
+    // a saved 'available' filter keeps its saved sortKey.
+    restoring = true;
+    const saved = loadResultsView();
+    if (saved) {
+      filter = saved.filter;
+      sortKey = saved.sortKey;
+      sortDir = saved.sortDir;
+      hideTraps = saved.hideTraps;
+      pairMode = saved.pairMode;
+      // Budget is stored as USD cents; convert back to display currency
+      // for the input. USD: cents/100; RUB/EUR: cents/100 × rate.
+      if (saved.budget > 0) {
+        const usd = saved.budget / 100;
+        let display = usd;
+        if ($settings.currency === 'RUB') display = usd * $settings.rates.RUB;
+        else if ($settings.currency === 'EUR') display = usd * $settings.rates.EUR;
+        // Round to 2 decimals to avoid float noise in the input.
+        budgetInput = (Math.round(display * 100) / 100).toString();
+      }
+    }
+
+    // Consume shared view from a share link (one-shot). CheckTab stashes
+    // parsed share fields into the sharedView store; we apply them here.
+    const shared = get(sharedView);
+    if (shared) {
+      if (shared.filter) filter = shared.filter;
+      if (shared.sortKey) sortKey = shared.sortKey;
+      if (shared.sortDir) sortDir = shared.sortDir;
+      if (shared.query) query = shared.query;
+      sharedView.set(null);
+    }
+
+    // Clear restoring on the next microtask so the $effects that depend
+    // on filter/sortKey/sortDir see the restored values without the
+    // auto-tco override firing.
+    setTimeout(() => {
+      restoring = false;
+    }, 0);
+  });
+
+  onDestroy(() => {
+    document.removeEventListener('keydown', onKeydown);
+  });
+
+  function toggleMenu(domain: string): void {
+    menuFor = menuFor === domain ? null : domain;
+  }
+
+  interface RowData {
+    result: CheckResult;
+    best: { registrarId: string; entry: PriceEntry } | null;
+    tco: number | null;
+    firstYear: number | null;
+    /** Original standard first-year price (non-null only when a premium
+     *  override or coupon discount is active, for struck-through display). */
+    standardFirstYear: number | null;
+    renewal: number | null;
+    /** Registrar id offering the cheapest renewal (for the renewal badge). */
+    renewalRegistrarId: string | null;
+    /** True only when a DigMyName premium override is active (not for coupons). */
+    isPremiumOverride: boolean;
+  }
+
+  const rows = $derived.by(() => {
+    const table = $pricing?.table ?? null;
+    const arr: RowData[] = [];
+    for (const r of $results.values()) {
+      const best = table ? bestEntry(table, r.tld) : null;
+      const override = premiumOverrides[r.domain] ?? null;
+      const stdFirstYear = best?.entry.reg ?? null;
+      const stdTco = table ? tco3(table, r.tld) : null;
+      const renewalBest = table && pairMode === 'best' ? bestRenewal(table, r.tld) : null;
+      const coupon = table ? bestCoupon(table, r.tld) : null;
+      const couponPrice = couponEffectivePrice(stdFirstYear, coupon);
+      const couponApplies =
+        couponPrice != null && stdFirstYear != null && couponPrice < stdFirstYear;
+      arr.push({
+        result: r,
+        best,
+        tco: override ?? stdTco,
+        firstYear: override ?? (couponApplies && couponPrice != null ? couponPrice : stdFirstYear),
+        standardFirstYear: override != null || couponApplies ? stdFirstYear : null,
+        renewal: renewalBest?.renew ?? best?.entry.renew ?? null,
+        renewalRegistrarId: renewalBest?.registrarId ?? best?.registrarId ?? null,
+        isPremiumOverride: override != null,
+      });
+    }
+    return arr;
+  });
+
+  const filterResult = $derived.by(() => {
+    const budgetCents = displayToUsdCents(
+      parseFloat(budgetInput) || 0,
+      $settings,
+    );
+    return applyViewFilters(rows, {
+      filter,
+      query,
+      budgetCents,
+      hideTraps,
+      favorites: $favorites,
+    });
+  });
+
+  const filtered = $derived(filterResult.rows);
+  const trapsHidden = $derived(filterResult.trapsHidden);
+
+  const sorted = $derived.by(() => {
+    const arr = [...filtered];
+    const dir = sortDir === 'asc' ? 1 : -1;
+    arr.sort((a, b) => {
+      switch (sortKey) {
+        case 'name':
+          return a.result.domain.localeCompare(b.result.domain) * dir;
+        case 'price':
+          return ((a.firstYear ?? Infinity) - (b.firstYear ?? Infinity)) * dir;
+        case 'renew':
+          return ((a.renewal ?? Infinity) - (b.renewal ?? Infinity)) * dir;
+        case 'tco':
+          return ((a.tco ?? Infinity) - (b.tco ?? Infinity)) * dir;
+        case 'status':
+          return a.result.status.localeCompare(b.result.status) * dir;
+        default:
+          return 0;
+      }
+    });
+    return arr;
+  });
+
+  const visible = $derived(sorted.slice(0, visibleCount));
+
+  let prevFilter: FilterKey = 'all';
+
+  $effect(() => {
+    void filter;
+    void sortKey;
+    void sortDir;
+    void query;
+    visibleCount = 100;
+    // When switching to the Available filter with the default name sort,
+    // default to TCO sort (cheapest total cost first). Manual sorts are
+    // preserved: only the default 'name' sort is overridden. Suppressed
+    // during restore so a persisted/shared 'available' filter doesn't
+    // clobber a saved sortKey.
+    if (filter === 'available' && prevFilter !== 'available' && sortKey === 'name' && !restoring) {
+      sortKey = 'tco';
+      sortDir = 'asc';
+    }
+    prevFilter = filter;
+  });
+
+  // Persist the results view (debounced ~300ms) on every change.
+  $effect(() => {
+    // Touch all reactive deps so the effect re-runs on any change.
+    void filter;
+    void sortKey;
+    void sortDir;
+    void budgetInput;
+    void hideTraps;
+    void pairMode;
+    // Skip the initial run while restoring (the restore itself writes).
+    if (restoring) return;
+    const view: ResultsView = {
+      v: 1,
+      filter,
+      sortKey,
+      sortDir,
+      budget: displayToUsdCents(parseFloat(budgetInput) || 0, $settings),
+      hideTraps,
+      pairMode,
+    };
+    saveResultsView(view);
+  });
+
+  $effect(() => {
+    const resultsMap = $results;
+    if (selected.size === 0) return;
+    const next = new Set<string>();
+    for (const d of selected) {
+      if (resultsMap.has(d)) next.add(d);
+    }
+    if (next.size !== selected.size) {
+      selected = next;
+    }
+  });
+
+  let sentinelEl: HTMLElement | null = $state(null);
+  let observer: IntersectionObserver | null = null;
+  let rafId: number | null = null;
+
+  function maybeExtend() {
+    if (rafId != null) return;
+    rafId = requestAnimationFrame(() => {
+      rafId = null;
+      visibleCount = Math.min(visibleCount + 100, sorted.length);
+    });
+  }
+
+  onMount(() => {
+    observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting && visibleCount < sorted.length) {
+          maybeExtend();
+        }
+      },
+      { rootMargin: '200px' },
+    );
+    if (sentinelEl) observer.observe(sentinelEl);
+  });
+
+  onDestroy(() => {
+    observer?.disconnect();
+    if (rafId != null) cancelAnimationFrame(rafId);
+    if (availCopiedTimer != null) clearTimeout(availCopiedTimer);
+    // Terminate any recheck engines still in flight so unmounting the table
+    // (e.g. switching tabs) does not leak workers or keep hitting registries.
+    for (const e of recheckEngines) e.destroy();
+    recheckEngines.clear();
+  });
+
+  // Publish the current filtered+sorted view to the exportRows store so the
+  // Check-tab export menu (CSV/TSV/Markdown copy) can access it.
+  $effect(() => {
+    const s = $settings;
+    const list = sorted.map((r) => ({
+      domain: r.result.domain,
+      status: r.result.status,
+      priceFirstYear: r.firstYear != null ? formatPrice(r.firstYear, s) : '',
+      priceRenewal: r.renewal != null ? formatPrice(r.renewal, s) : '',
+      priceTco: r.tco != null ? formatPrice(r.tco, s) : '',
+    }));
+    exportRows.set(list);
+  });
+
+  // One-shot bridge: the watch banner's "Show favorites" button sets
+  // requestFavoritesView=true; we consume it once (switch filter, reset).
+  let consumedFavRequest = false;
+  $effect(() => {
+    const req = $requestFavoritesView;
+    if (req && !consumedFavRequest) {
+      consumedFavRequest = true;
+      filter = 'favorites';
+      requestFavoritesView.set(false);
+      // Allow the next request to be consumed.
+      setTimeout(() => {
+        consumedFavRequest = false;
+      }, 0);
+    }
+  });
+
+  $effect(() => {
+    const len = sorted.length;
+    if (len > visibleCount && sentinelEl && observer) {
+      observer.unobserve(sentinelEl);
+      observer.observe(sentinelEl);
+    }
+  });
+
+  function toggleSort(key: SortKey) {
+    if (sortKey === key) {
+      sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+    } else {
+      sortKey = key;
+      sortDir = 'asc';
+    }
+  }
+
+  function ariaSort(key: SortKey): 'ascending' | 'descending' | 'none' {
+    if (sortKey !== key) return 'none';
+    return sortDir === 'asc' ? 'ascending' : 'descending';
+  }
+
+  function registrarFor(tld: string): { registrar: RegistrarConfig | null; entry: PriceEntry | null } {
+    const table = $pricing?.table ?? null;
+    if (!table) return { registrar: null, entry: null };
+    const entries = table.tlds[tld];
+    if (!entries) return { registrar: null, entry: null };
+    // Prefer the cheapest registrar whose searchUrl supports a {domain}
+    // deep link; only fall back to a landing-only registrar when no
+    // deep-link registrar has a quote for the zone.
+    let best: { registrar: RegistrarConfig; entry: PriceEntry } | null = null;
+    let fallback: { registrar: RegistrarConfig; entry: PriceEntry } | null = null;
+    for (const r of registrars) {
+      const e = entries[r.id];
+      if (!e || e.reg == null) continue;
+      const hasDeepLink = r.searchUrl.includes('{domain}');
+      const candidate = { registrar: r, entry: e };
+      if (hasDeepLink) {
+        if (!best || e.reg < (best.entry.reg ?? Infinity)) best = candidate;
+      } else {
+        if (!fallback || e.reg < (fallback.entry.reg ?? Infinity)) fallback = candidate;
+      }
+    }
+    return best ?? fallback ?? { registrar: null, entry: null };
+  }
+
+  /** Known-registrar quotes for a zone from the pricing store, sorted by
+   *  registration price asc (renewal as tie-breaker). Unknown ids skipped.
+   *  Each quote carries a buy/search link (deep link when the registrar's
+   *  template supports '{domain}', landing page otherwise) and a
+   *  hasDeepLink flag for the no-deeplink tooltip. */
+  function registrarQuotes(tld: string, domain: string): RegistrarQuote[] {
+    const table = $pricing?.table ?? null;
+    if (!table) return [];
+    const entries = table.tlds[tld];
+    if (!entries) return [];
+    const list: RegistrarQuote[] = [];
+    for (const r of registrars) {
+      const e = entries[r.id];
+      if (!e || e.reg == null) continue;
+      const hasDeepLink = r.searchUrl.includes('{domain}');
+      list.push({
+        id: r.id,
+        name: r.name,
+        reg: e.reg,
+        renew: e.renew,
+        hasDeepLink,
+        url: applyAffiliate(
+          r,
+          hasDeepLink
+            ? r.searchUrl.replace('{domain}', encodeURIComponent(domain))
+            : r.searchUrl,
+        ),
+      });
+    }
+    list.sort((a, b) => a.reg - b.reg || (a.renew ?? Infinity) - (b.renew ?? Infinity));
+    return list;
+  }
+
+  function priceColor(cents: number | null): string {
+    if (cents == null) return 'var(--text-tertiary)';
+    const tier = priceTier(cents);
+    if (tier === 'cheap') return 'var(--price-cheap)';
+    if (tier === 'mid') return 'var(--price-mid)';
+    return 'var(--price-high)';
+  }
+
+  function couponFor(tld: string) {
+    const table = $pricing?.table;
+    if (!table) return null;
+    return bestCoupon(table, tld);
+  }
+
+  // ---- On-demand per-domain detail (DigMyName: premium + cheapest registrar) ----
+
+  let detailFor = $state<string | null>(null);
+  let details = $state<Record<string, DigDetail>>({});
+
+  /** Per-domain premium price override (USD cents) from the on-demand
+   *  DigMyName check. When present, the row price cell shows this instead
+   *  of the standard first-year price, with the standard price struck
+   *  through. Sorting by price/tco also uses this value. */
+  let premiumOverrides = $state<Record<string, number>>({});
+
+  async function toggleDetail(domain: string): Promise<void> {
+    if (detailFor === domain) {
+      detailFor = null;
+      return;
+    }
+    detailFor = domain;
+    // Close any open row menu when expanding.
+    menuFor = null;
+    const cached = details[domain];
+    if (cached && !cached.failed) return;
+    details = {
+      ...details,
+      [domain]: { loading: true, price: null, registrar: null, regPrice: null, url: null },
+    };
+    const detail = await fetchPremiumDetail(domain);
+    // Store a per-domain override so the row price cell and detail chip
+    // both reflect the registry premium price (single source).
+    if (isPremiumPriced(detail)) {
+      const override = premiumOverrideCents(detail);
+      if (override != null) {
+        premiumOverrides = { ...premiumOverrides, [domain]: override };
+      }
+    }
+    details = { ...details, [domain]: detail };
+  }
+
+  // ---- Bulk "check premium prices" toolbar action ----
+
+  /** Cap on how many domains the bulk premium check will query in one click.
+   *  DigMyName is on-demand and rate-limited client-side; 20 keeps it polite. */
+  const PREMIUM_CHECK_CAP = 20;
+
+  let premiumChecking = $state(false);
+  let premiumDone = $state(0);
+  let premiumTotal = $state(0);
+  let premiumFound = $state(0);
+
+  /** Available/probably_available rows not yet premium-checked, sorted by
+   *  cheapest first-year price asc. A row is "checked" once it has a non-failed
+   *  entry in `details` (premium or not) or an existing `premiumOverrides`
+   *  entry (already known premium). */
+  const premiumCheckEligible = $derived.by(() => {
+    const table = $pricing?.table ?? null;
+    const list: { domain: string; firstYear: number | null }[] = [];
+    for (const r of $results.values()) {
+      if (r.status !== 'available' && r.status !== 'probably_available') continue;
+      if (premiumOverrides[r.domain] != null) continue;
+      const d = details[r.domain];
+      if (d && !d.failed) continue;
+      const best = table ? bestEntry(table, r.tld) : null;
+      list.push({ domain: r.domain, firstYear: best?.entry.reg ?? null });
+    }
+    list.sort((a, b) => (a.firstYear ?? Infinity) - (b.firstYear ?? Infinity));
+    return list;
+  });
+
+  const canPremiumCheck = $derived(
+    $runState.phase === 'done' && !premiumChecking && premiumCheckEligible.length > 0,
+  );
+
+  /** Bulk-fetch DigMyName premium data for the cheapest eligible available
+   *  domains (capped at PREMIUM_CHECK_CAP). Concurrency 2 — sequential-friendly
+   *  to DigMyName. Premium results with a numeric price are stored into
+   *  `premiumOverrides` so the price cell shows the real price + strike + chip. */
+  async function runPremiumCheck(): Promise<void> {
+    if (!canPremiumCheck) return;
+    const targets = premiumCheckEligible.slice(0, PREMIUM_CHECK_CAP);
+    premiumChecking = true;
+    premiumDone = 0;
+    premiumTotal = targets.length;
+    premiumFound = 0;
+
+    let idx = 0;
+    const worker = async (): Promise<void> => {
+      while (idx < targets.length) {
+        const i = idx++;
+        const target = targets[i];
+        if (!target) break;
+        const { domain } = target;
+        const detail = await fetchPremiumDetail(domain);
+        details = { ...details, [domain]: detail };
+        if (isPremiumPriced(detail)) {
+          const override = premiumOverrideCents(detail);
+          if (override != null) {
+            premiumOverrides = { ...premiumOverrides, [domain]: override };
+            premiumFound++;
+          }
+        }
+        premiumDone++;
+      }
+    };
+    // Two concurrent workers — simple promise pool, no new deps.
+    await Promise.all([worker(), worker()]);
+
+    premiumChecking = false;
+  }
+
+  async function handleCopy(domain: string) {
+    const ok = await copyText(domain);
+    if (ok) {
+      const next = new Set(copied);
+      next.add(domain);
+      copied = next;
+      setTimeout(() => {
+        const next2 = new Set(copied);
+        next2.delete(domain);
+        copied = next2;
+      }, 1500);
+    }
+  }
+
+  function recheck(domain: string) {
+    // Cap concurrent rechecks: ignore clicks beyond the limit so a burst of
+    // recheck clicks cannot spawn many parallel engines hammering registries.
+    if (rechecking.size >= MAX_RECHECKS) return;
+    const next = new Set(rechecking);
+    next.add(domain);
+    rechecking = next;
+
+    const registryVal = get(registry);
+    const settingsVal = $settings;
+    const options: EngineOptions = {
+      registry: registryVal,
+      proxyUrl: settingsVal.proxyUrl || undefined,
+      fetchTimeoutMs: 10000,
+      maxRetries: 3,
+    };
+    options.concurrency = 1;
+
+    const applyResult = (r: CheckResult): void => {
+      results.update((map) => {
+        const next = new Map(map);
+        next.set(r.domain, r);
+        return next;
+      });
+      putCache(r.domain, {
+        status: r.status,
+        source: r.source,
+        ts: r.checkedAt,
+        tld: r.tld,
+      });
+    };
+    const e: EngineHandle = createEngine((event) => {
+      if (event.type === 'result' || event.type === 'batch') {
+        if (event.type === 'result') applyResult(event.result);
+        else for (const r of event.results) applyResult(r);
+        const next2 = new Set(rechecking);
+        next2.delete(domain);
+        rechecking = next2;
+      } else if (event.type === 'finished') {
+        e.destroy();
+        recheckEngines.delete(e);
+        const next2 = new Set(rechecking);
+        next2.delete(domain);
+        rechecking = next2;
+      }
+    });
+    recheckEngines.add(e);
+    e.start([domain], options);
+  }
+
+  const hasResults = $derived($results.size > 0);
+
+  /** Neutral skeleton rows for pending candidates while a run streams.
+   *  Pending domain names are not in the results store yet, so the rows are
+   *  name-less pulsing bars derived from total − done. Rendered after the
+   *  real rows, capped, aria-hidden, and never part of sorting/filtering/
+   *  selection/export (they live outside `visible`). Shown only in the
+   *  default view — a pending candidate's status is unknown, so skeletons
+   *  would mislead inside a status filter or a search result. */
+  const SKELETON_CAP = 20;
+  const skeletonCount = $derived(
+    $runState.phase === 'running' && filter === 'all' && query.trim() === ''
+      ? Math.min(Math.max($runState.total - $runState.done, 0), SKELETON_CAP)
+      : 0,
+  );
+
+  /** Map domain -> WatchChip for O(1) row chip lookup. */
+  const watchByDomain = $derived.by(() => {
+    interface WatchChip {
+      kind: 'freed' | 'taken' | 'price_drop';
+      priceOld?: number;
+      priceNew?: number;
+    }
+    const m = new Map<string, WatchChip>();
+    for (const c of $watchChanges) {
+      if (c.kind === 'price_drop') {
+        m.set(c.domain, { kind: 'price_drop', priceOld: c.priceOld, priceNew: c.priceNew });
+        continue;
+      }
+      const ch = classifyChange(c.from, c.to);
+      if (ch) m.set(c.domain, { kind: ch });
+    }
+    return m;
+  });
+
+  const availableTotal = $derived.by(() => {
+    let n = 0;
+    for (const r of $results.values()) {
+      if (r.status === 'available' || r.status === 'probably_available') n += 1;
+    }
+    return n;
+  });
+
+  /** Domain names of available/probably_available results, sorted A–Z. */
+  const availableDomains = $derived.by(() => {
+    const list: string[] = [];
+    for (const r of $results.values()) {
+      if (r.status === 'available' || r.status === 'probably_available') list.push(r.domain);
+    }
+    list.sort((a, b) => a.localeCompare(b));
+    return list;
+  });
+
+  function flashAvailCopied(): void {
+    availCopied = true;
+    if (availCopiedTimer != null) clearTimeout(availCopiedTimer);
+    availCopiedTimer = setTimeout(() => {
+      availCopied = false;
+    }, 1500);
+  }
+
+  async function copyAvailableList(): Promise<void> {
+    await copyText(availableDomains.join('\n'));
+    flashAvailCopied();
+  }
+
+  function favAllAvailable(): void {
+    const next = new Set($favorites);
+    for (const d of availableDomains) next.add(d);
+    favorites.set(next);
+  }
+
+  function downloadAvailableCsv(): void {
+    const table = $pricing?.table ?? null;
+    const filtered = new Map<string, CheckResult>();
+    for (const [d, r] of $results) {
+      if (r.status === 'available' || r.status === 'probably_available') filtered.set(d, r);
+    }
+    const rows = resultsToCsvRows(filtered, table, $settings);
+    const headers = [
+      t('csv.domain'),
+      t('csv.status'),
+      t('csv.tld'),
+      t('csv.priceFirstYear'),
+      t('csv.priceRenewal'),
+      t('csv.bestRegistrar'),
+      t('csv.buyUrl'),
+      t('csv.checkedAt'),
+    ];
+    const csv = buildCsv(rows, headers);
+    const date = new Date().toISOString().slice(0, 10);
+    downloadCsv(`domain-hunter-available-${date}.csv`, csv);
+  }
+
+  function registrarName(id: string): string {
+    return registrars.find((r) => r.id === id)?.name ?? id;
+  }
+
+  /** Title for the registrar source badge: full name plus the price source.
+   *  Live fetches list their registrar id in table.sources; every other
+   *  entry comes from the bundled snapshot baseline. */
+  function registrarBadgeTitle(id: string): string {
+    const name = registrarName(id);
+    const sources = $pricing?.table.sources ?? [];
+    if (sources.length === 0) return name;
+    return `${name} · ${sources.includes(id) ? 'live' : 'snapshot'}`;
+  }
+</script>
+
+{#if !hasResults}
+  <!-- EmptyState rendered by parent -->
+{:else}
+  <div class="results">
+    <div class="toolbar">
+      <div class="filters" role="group" aria-label={t('results.title')}>
+        <button class="filter" class:active={filter === 'all'} onclick={() => (filter = 'all')} type="button" data-testid="results-filter-all">
+          {t('results.filters.all')}
+        </button>
+        <button class="filter" class:active={filter === 'available'} onclick={() => (filter = 'available')} type="button" data-testid="results-filter-available">
+          {t('results.filters.available')}
+        </button>
+        <button class="filter" class:active={filter === 'taken'} onclick={() => (filter = 'taken')} type="button" data-testid="results-filter-taken">
+          {t('results.filters.taken')}
+        </button>
+        <button class="filter" class:active={filter === 'problems'} onclick={() => (filter = 'problems')} type="button" data-testid="results-filter-problems">
+          {t('results.filters.problems')}
+        </button>
+        <button class="filter" class:active={filter === 'favorites'} onclick={() => (filter = 'favorites')} type="button" data-testid="results-filter-favorites">
+          {t('results.filters.favorites')}{#if $favorites.size > 0} · <span class="nums">{$favorites.size}</span>{/if}
+        </button>
+        <Tooltip text={t('watch.refresh.aria')}>
+          <button
+            class="action-btn watch-refresh"
+            type="button"
+            onclick={() => void refreshWatchlist()}
+            disabled={$watchRunning}
+            aria-label={t('watch.refresh.aria')}
+            title={t('watch.refresh.aria')}
+            data-testid="results-watch-refresh"
+          >
+            <IconRefresh class={$watchRunning ? 'spin' : ''} />
+          </button>
+        </Tooltip>
+      </div>
+      <div class="search-wrap">
+        <input
+          class="search"
+          type="search"
+          placeholder={t('results.search')}
+          aria-label={t('results.search')}
+          bind:value={query}
+          bind:this={searchEl}
+          data-testid="results-search"
+        />
+        <kbd class="search-kbd" aria-hidden="true">/</kbd>
+      </div>
+      <div class="budget-wrap">
+        <input
+          class="budget-input"
+          type="number"
+          min="0"
+          step="0.01"
+          placeholder={t('results.budget.label')}
+          aria-label={t('results.budget.aria')}
+          title={t('results.budget.aria')}
+          bind:value={budgetInput}
+          data-testid="results-budget-input"
+        />
+      </div>
+      <button
+        class="filter toggle-btn"
+        class:active={hideTraps}
+        type="button"
+        aria-pressed={hideTraps}
+        aria-label={t('results.hideTraps.aria')}
+        title={t('results.hideTraps.aria')}
+        onclick={() => (hideTraps = !hideTraps)}
+        data-testid="results-hide-traps"
+      >
+        {#if hideTraps && trapsHidden > 0}
+          {t('results.hideTraps.count', { n: trapsHidden })}
+        {:else}
+          {t('results.hideTraps')}
+        {/if}
+      </button>
+      <button
+        class="filter toggle-btn"
+        class:active={pairMode === 'paired'}
+        type="button"
+        aria-pressed={pairMode === 'paired'}
+        aria-label={t('results.pairMode.aria')}
+        title={t('results.pairMode.aria')}
+        onclick={() => (pairMode = pairMode === 'paired' ? 'best' : 'paired')}
+        data-testid="results-pair-toggle"
+      >
+        {pairMode === 'paired' ? t('results.pairMode.paired') : t('results.pairMode.best')}
+      </button>
+      <!-- Meta row: legend + showing-count + select-all link on the left,
+           bulk actions (premium-check, show-available, ⋯ menu) on the right. -->
+      <div class="meta-row">
+        <div class="meta-left">
+          <LegendPopover />
+          <span class="count nums" aria-live="polite" data-testid="results-showing-count">
+            {t('results.showing', { shown: visible.length, total: sorted.length })}
+          </span>
+          {#if sorted.length > visible.length}
+            <button
+              class="action-link select-all-matching"
+              type="button"
+              onclick={() => {
+                selected = new Set(sorted.map((r) => r.result.domain));
+              }}
+              aria-label={t('results.selectAllMatching.aria')}
+              title={t('results.selectAllMatching.aria')}
+              data-testid="results-select-all-matching"
+            >
+              {t('results.selectAllMatching', { n: sorted.length })}
+            </button>
+          {/if}
+          {#if selected.size > 0}
+            <button class="action-link" type="button" onclick={async () => { await copyText([...selected].sort().join('\n')); selected = new Set(); }} data-testid="results-copy-selected">
+              {t('results.copy.selected', { n: selected.size })}
+            </button>
+          {/if}
+          {#if filter === 'favorites' && $favorites.size > 0}
+            <button class="action-link" type="button" onclick={() => copyText([...$favorites].sort().join('\n'))} data-testid="results-copy-favorites">
+              {t('results.fav.copy', { n: $favorites.size })}
+            </button>
+          {/if}
+        </div>
+        {#if $runState.phase === 'done' && ((filter === 'all' && availableTotal > 0) || premiumCheckEligible.length > 0 || premiumFound > 0 || premiumChecking)}
+          <div class="meta-right">
+            {#if premiumCheckEligible.length > 0 || premiumFound > 0 || premiumChecking}
+              <Tooltip text={t('results.premium.aria')}>
+                <button
+                  class="ghost-btn premium-check"
+                  type="button"
+                  onclick={() => void runPremiumCheck()}
+                  disabled={!canPremiumCheck}
+                  aria-label={t('results.premium.aria')}
+                  title={t('results.premium.aria')}
+                  data-testid="results-premium-check"
+                >
+                  <IconTag />
+                  {#if premiumChecking}
+                    {t('results.premium.checking', { done: premiumDone, total: premiumTotal })}
+                  {:else}
+                    {t('results.premium.check')}
+                  {/if}
+                </button>
+              </Tooltip>
+              {#if !premiumChecking && premiumFound > 0}
+                <span class="chip-tag premium" data-testid="results-premium-found">
+                  {t('results.premium.found', { n: premiumFound })}
+                </span>
+              {/if}
+            {/if}
+            {#if filter === 'all' && availableTotal > 0}
+              <button class="ghost-btn suggest" type="button" onclick={() => (filter = 'available')} data-testid="results-filter-suggest-available">
+                {t('results.showAvailable', { n: availableTotal })}
+              </button>
+              <AvailableMenu
+                availCopied={availCopied}
+                onCopy={() => void copyAvailableList()}
+                onFav={() => favAllAvailable()}
+                onCsv={() => downloadAvailableCsv()}
+              />
+            {/if}
+          </div>
+        {/if}
+      </div>
+    </div>
+
+    {#if filter === 'favorites' && $favorites.size === 0}
+      <p class="fav-empty">{t('results.favorites.empty')}</p>
+    {:else}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th class="select-cell">
+              <input
+                type="checkbox"
+                data-testid="results-select-all"
+                aria-label={t('results.select.all')}
+                checked={visible.length > 0 && visible.every((r) => selected.has(r.result.domain))}
+                onchange={() => {
+                  const next = new Set(selected);
+                  if (visible.every((r) => next.has(r.result.domain))) {
+                    for (const r of visible) next.delete(r.result.domain);
+                  } else {
+                    for (const r of visible) next.add(r.result.domain);
+                  }
+                  selected = next;
+                }}
+              />
+            </th>
+            <th aria-sort={ariaSort('name')}>
+              <button class="sort-btn" onclick={() => toggleSort('name')} type="button" data-testid="results-sort-name">
+                {t('results.sort.name')}
+                <span class="sort-arrow" class:visible={sortKey === 'name'} class:desc={sortDir === 'desc'} aria-hidden="true">▲</span>
+              </button>
+            </th>
+            <th aria-sort={ariaSort('status')}>
+              <button class="sort-btn" onclick={() => toggleSort('status')} type="button" data-testid="results-sort-status">
+                {t('results.col.status')}
+                <span class="sort-arrow" class:visible={sortKey === 'status'} class:desc={sortDir === 'desc'} aria-hidden="true">▲</span>
+              </button>
+            </th>
+            <th class="price-col" aria-sort={ariaSort('price')}>
+              <button class="sort-btn" onclick={() => toggleSort('price')} type="button" data-testid="results-sort-price">
+                {t('results.col.price')}
+                <span class="sort-arrow" class:visible={sortKey === 'price'} class:desc={sortDir === 'desc'} aria-hidden="true">▲</span>
+              </button>
+            </th>
+            <th class="renew-col" aria-sort={ariaSort('renew')}>
+              <button class="sort-btn" onclick={() => toggleSort('renew')} type="button" data-testid="results-sort-renew">
+                {t('price.renewal')}
+                <span class="sort-arrow" class:visible={sortKey === 'renew'} class:desc={sortDir === 'desc'} aria-hidden="true">▲</span>
+              </button>
+            </th>
+            <th class="actions-col">{t('results.col.actions')}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each visible as row (row.result.domain)}
+            {@const isAvail = row.result.status === 'available' || row.result.status === 'probably_available'}
+            {@const isErr = row.result.status === 'error'}
+            {@const buyInfo = registrarFor(row.result.tld)}
+            {@const buy = buyInfo.registrar
+              ? applyAffiliate(
+                  buyInfo.registrar,
+                  buyInfo.registrar.searchUrl.includes('{domain}')
+                    ? buyInfo.registrar.searchUrl.replace(
+                        '{domain}',
+                        encodeURIComponent(row.result.domain),
+                      )
+                    : buyInfo.registrar.searchUrl,
+                )
+              : null}
+            {@const buyHasDeepLink = buyInfo.registrar?.searchUrl.includes('{domain}') ?? false}
+            {@const coupon = couponFor(row.result.tld)}
+            {@const trap = row.best ? isPromoTrap(row.best.entry) : false}
+            {@const promo = row.firstYear != null && isBelowFloor(row.result.tld, row.firstYear)}
+            {@const isFav = $favorites.has(row.result.domain)}
+            {@const sid = sanitizeId(row.result.domain)}
+            {@const isExpanded = detailFor === row.result.domain}
+            {@const quotes = registrarQuotes(row.result.tld, row.result.domain)}
+            <tr class="row-in" class:available={isAvail} class:error={isErr} class:row-taken={row.result.status === 'taken'} data-testid={`results-row-${sid}`}>
+              <td class="select-cell">
+                <input
+                  type="checkbox"
+                  checked={selected.has(row.result.domain)}
+                  data-testid={`results-row-select-${sid}`}
+                  aria-label={t('results.select.row.aria', { domain: row.result.domain })}
+                  onchange={() => {
+                    const next = new Set(selected);
+                    if (next.has(row.result.domain)) next.delete(row.result.domain);
+                    else next.add(row.result.domain);
+                    selected = next;
+                  }}
+                />
+              </td>
+              <td class="domain-cell">
+                {#if buy}
+                  <a
+                    class="domain-link"
+                    href={buy}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    aria-label={t('results.domain.aria', { domain: row.result.domain, registrar: buyInfo.registrar?.name ?? '' })}
+                    data-testid={`results-row-link-${sid}`}
+                  >
+                    {row.result.domain}
+                  </a>
+                {:else}
+                  <span class="domain-text">{row.result.domain}</span>
+                {/if}
+              </td>
+              <td class="status-cell">
+                <StatusBadge status={row.result.status} size="sm" />
+                {#if watchByDomain.has(row.result.domain)}
+                  {@const wc = watchByDomain.get(row.result.domain)}
+                  {#if wc?.kind === 'freed'}
+                    <span class="chip-tag watch-freed" data-testid={`results-watch-${sid}`}>{t('watch.badge.freed')}</span>
+                  {:else if wc?.kind === 'taken'}
+                    <span class="chip-tag watch-taken" data-testid={`results-watch-${sid}`}>{t('watch.badge.taken')}</span>
+                  {:else if wc?.kind === 'price_drop'}
+                    {@const pct = wc.priceOld != null && wc.priceNew != null && wc.priceOld > 0
+                      ? Math.round((wc.priceOld - wc.priceNew) / wc.priceOld * 100)
+                      : 0}
+                    <Tooltip text={t('tooltip.priceDrop', {
+                      pct,
+                      old: formatPrice(wc.priceOld ?? null, $settings),
+                      new: formatPrice(wc.priceNew ?? null, $settings),
+                    })}>
+                      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+                      <span class="chip-tag watch-price-drop" tabindex="0" data-testid={`results-watch-${sid}`}>{t('watch.badge.priceDrop')}</span>
+                    </Tooltip>
+                  {/if}
+                {/if}
+              </td>
+              <td class="price-cell nums">
+                <div class="price-stack">
+                  {#if row.standardFirstYear != null}
+                    <span class="price-strike">{formatPrice(row.standardFirstYear, $settings)}</span>
+                  {/if}
+                  <span class="price-line">
+                    <span
+                      class="price"
+                      style="color: {row.standardFirstYear != null ? 'var(--amber)' : priceColor(row.firstYear)}"
+                    >
+                      {formatPrice(row.firstYear, $settings)}
+                    </span>
+                    {#if !row.isPremiumOverride && row.best}
+                      {@const rid = row.best.registrarId}
+                      {@const icon = REGISTRAR_ICONS[rid]}
+                      {@const mono = registrarMonogram(rid)}
+                      {@const badgeTitle = registrarBadgeTitle(rid)}
+                      {#if icon}
+                        <img
+                          src={icon}
+                          alt=""
+                          class="reg-badge reg-img"
+                          title={badgeTitle}
+                          aria-label={badgeTitle}
+                        />
+                      {:else}
+                        <span
+                          class="reg-badge"
+                          style="--reg-hue: {mono.hue}"
+                          title={badgeTitle}
+                          aria-label={badgeTitle}
+                        >{mono.short}</span>
+                      {/if}
+                    {/if}
+                  </span>
+                  {#if row.isPremiumOverride}
+                    <Tooltip text={t('results.detail.premium', { price: formatPrice(row.firstYear, $settings) })}>
+                      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+                      <span class="chip-tag premium" tabindex="0" data-testid={`results-chip-premium-${sid}`}>{t('price.premium')}</span>
+                    </Tooltip>
+                  {/if}
+                  {#if promo}
+                    <Tooltip text={t('tooltip.promo')}>
+                      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+                      <span class="chip-tag promo" tabindex="0" data-testid={`results-chip-promo-${sid}`}>{t('price.promo')}</span>
+                    </Tooltip>
+                  {/if}
+                  {#if trap && row.best}
+                    {@const reg = row.best.entry.reg ?? 0}
+                    {@const renew = row.best.entry.renew ?? 0}
+                    {@const first = formatPrice(reg, $settings)}
+                    {@const renewal = formatPrice(renew, $settings)}
+                    {@const times = reg > 0 ? Math.round(renew / reg) : 0}
+                    <Tooltip text={t('tooltip.promoTrap', { first, renew: renewal, times })}>
+                      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+                      <span class="chip-tag trap" tabindex="0" data-testid={`results-chip-trap-${sid}`}>{t('price.promoTrap')}</span>
+                    </Tooltip>
+                  {/if}
+                  {#if isAvail && premiumLikely(row.result.domain.slice(0, -(row.result.tld.length + 1)), row.result.tld)}
+                    <Tooltip text={t('tooltip.premiumLikely')}>
+                      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+                      <span class="chip-tag premium-likely" tabindex="0" data-testid={`results-chip-premium-likely-${sid}`}>{t('price.premiumLikely')}</span>
+                    </Tooltip>
+                  {/if}
+                  {#if coupon && row.best != null && row.best.entry.reg != null}
+                    {@const reg = row.best.entry.reg ?? 0}
+                    <span class="coupon">
+                      {t('price.coupon', { price: formatPrice(Math.max(0, reg - couponDiscountCents(coupon, reg)), $settings), code: coupon.code })}
+                    </span>
+                  {/if}
+                </div>
+              </td>
+              <td class="renew-cell nums">
+                <span class="renew-line">
+                  <!-- Renewal stays neutral (tier colors live on the 1st-year column only). -->
+                  <span class="renew">{formatPrice(row.renewal, $settings)}</span>
+                  {#if row.renewalRegistrarId}
+                    {@const rid = row.renewalRegistrarId}
+                    {@const icon = REGISTRAR_ICONS[rid]}
+                    {@const mono = registrarMonogram(rid)}
+                    {@const badgeTitle = registrarBadgeTitle(rid)}
+                    {#if icon}
+                      <img
+                        src={icon}
+                        alt=""
+                        class="reg-badge reg-img"
+                        title={badgeTitle}
+                        aria-label={badgeTitle}
+                      />
+                    {:else}
+                      <span
+                        class="reg-badge"
+                        style="--reg-hue: {mono.hue}"
+                        title={badgeTitle}
+                        aria-label={badgeTitle}
+                      >{mono.short}</span>
+                    {/if}
+                  {/if}
+                </span>
+              </td>
+              <td class="actions-cell">
+                <div class="actions">
+                  <button
+                    class="action-btn"
+                    class:active={isFav}
+                    onclick={() => {
+                      const wasFav = isFav;
+                      toggleFavorite(row.result.domain);
+                      if (wasFav) {
+                        notePrice(row.result.domain, null);
+                      } else {
+                        notePrice(row.result.domain, row.best?.entry.reg ?? null);
+                      }
+                    }}
+                    type="button"
+                    aria-label={isFav ? t('results.fav.remove') : t('results.fav.add')}
+                    title={isFav ? t('results.fav.remove') : t('results.fav.add')}
+                    data-testid={`results-row-fav-${sid}`}
+                  >
+                    {#if isFav}
+                      <IconStar filled={true} />
+                    {:else}
+                      <IconStar />
+                    {/if}
+                  </button>
+                  {#if buy}
+                    {#if buyHasDeepLink}
+                      <a
+                        class="action-btn buy-btn"
+                        href={buy}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        aria-label={t('results.buy.aria', { domain: row.result.domain })}
+                        title={
+                          buyInfo.entry?.reg != null
+                            ? t('results.buy.at', {
+                                registrar: buyInfo.registrar?.name ?? '',
+                                price: formatPrice(buyInfo.entry.reg, $settings),
+                              })
+                            : t('results.buy')
+                        }
+                        data-testid={`results-row-buy-${sid}`}
+                      >
+                        <IconExternal />
+                      </a>
+                    {:else}
+                      <Tooltip text={t('registrar.noDeeplink', { registrar: buyInfo.registrar?.name ?? '' })}>
+                        <a
+                          class="action-btn buy-btn"
+                          href={buy}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          aria-label={t('results.buy.aria', { domain: row.result.domain })}
+                          data-testid={`results-row-buy-${sid}`}
+                        >
+                          <IconExternal />
+                        </a>
+                      </Tooltip>
+                    {/if}
+                  {:else}
+                    <!-- Invisible placeholder keeps the action-cluster geometry
+                         identical on rows without a buy link (star x-position
+                         must not shift between rows). -->
+                    <span class="action-btn buy-placeholder" aria-hidden="true" tabindex="-1">
+                      <IconExternal />
+                    </span>
+                  {/if}
+                  <RowMenu
+                    sid={sid}
+                    isOpen={menuFor === row.result.domain}
+                    copied={copied.has(row.result.domain)}
+                    rechecking={rechecking.has(row.result.domain)}
+                    recheckDisabled={rechecking.size >= MAX_RECHECKS}
+                    isExpanded={isExpanded}
+                    onTriggerClick={() => toggleMenu(row.result.domain)}
+                    onClose={() => (menuFor = null)}
+                    onCopy={() => void handleCopy(row.result.domain)}
+                    onRecheck={() => recheck(row.result.domain)}
+                    onDetail={() => { void toggleDetail(row.result.domain); }}
+                  />
+                </div>
+              </td>
+            </tr>
+            {#if isExpanded}
+              <DetailRow
+                {sid}
+                {row}
+                {isAvail}
+                {isErr}
+                detail={details[row.result.domain]}
+                {quotes}
+                premiumOverride={premiumOverrides[row.result.domain] ?? null}
+              />
+            {/if}
+          {/each}
+          {#if skeletonCount > 0}
+            {#each Array.from({ length: skeletonCount }, (v, i) => i) as si (`skel-${si}`)}
+              <tr class="skeleton-row" aria-hidden="true">
+                <td class="select-cell"><span class="skel-bar skel-check"></span></td>
+                <td class="domain-cell"><span class="skel-bar skel-domain"></span></td>
+                <td class="status-cell"><span class="skel-bar skel-status"></span></td>
+                <td class="price-cell"><span class="skel-bar skel-num"></span></td>
+                <td class="renew-cell"><span class="skel-bar skel-num"></span></td>
+                <td class="actions-cell"><span class="skel-bar skel-action"></span></td>
+              </tr>
+            {/each}
+          {/if}
+        </tbody>
+      </table>
+      <div bind:this={sentinelEl} class="sentinel" aria-hidden="true"></div>
+    </div>
+    {/if}
+  </div>
+{/if}
+
+<style>
+  .results {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    position: sticky;
+    top: 0;
+    z-index: 6;
+    background: var(--bg);
+    padding: var(--space-2) 0;
+    margin: calc(-1 * var(--space-2)) 0 0;
+  }
+  .filters {
+    display: flex;
+    gap: var(--space-1);
+    flex-wrap: wrap;
+  }
+  /* Keep the watch-refresh button on the filter-pill row: when the pills
+     wrap, it right-aligns on their row instead of orphaning on its own. */
+  .filters :global(.tip-wrap) {
+    margin-left: auto;
+  }
+  /* Meta row under the filter pills: legend + showing-count + select-all
+     link on the left, bulk actions on the right. flex-basis 100% forces it
+     onto its own line inside the wrapping toolbar. */
+  .meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    flex-basis: 100%;
+  }
+  .meta-left {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  /* Premium-check + "Show available (N)" + ⋯ menu never split across lines. */
+  .meta-right {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: var(--space-2);
+    margin-left: auto;
+  }
+  /* The ⋯ menu trigger shares the global .action-btn chrome; re-tint it to
+     the meta-row ghost style (transparent bg, stronger border, accent hover). */
+  .meta-right :global(.action-btn) {
+    background: transparent;
+    border-color: var(--border-strong);
+  }
+  .meta-right :global(.action-btn:hover) {
+    background: transparent;
+    border-color: var(--accent);
+    color: var(--text);
+  }
+  .filter {
+    padding: var(--space-1) var(--space-3);
+    border: 1px solid var(--border);
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    border-radius: var(--radius-full);
+    font-size: var(--text-xs);
+    font-weight: 500;
+    cursor: pointer;
+    min-height: 32px;
+    transition: all var(--dur) var(--ease);
+  }
+  .filter:hover {
+    border-color: var(--border-strong);
+    color: var(--text);
+  }
+  .filter.active {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .count {
+    font-size: var(--text-xs);
+    color: var(--text-tertiary);
+  }
+  .table-wrap {
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    box-shadow: var(--shadow-sm);
+    max-height: 72vh;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+  .table-wrap::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .table-wrap::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: var(--radius-full);
+  }
+  .table-wrap::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--text-sm);
+    min-width: 480px;
+  }
+  thead {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+  .table-wrap thead th {
+    position: sticky;
+    top: 0;
+    z-index: 4;
+    background: var(--bg-elevated);
+    box-shadow: 0 1px 0 var(--border);
+  }
+  th {
+    background: var(--bg-sunken);
+    border-bottom: 1px solid var(--border);
+    padding: var(--space-2) var(--space-3);
+    text-align: left;
+    font-weight: 600;
+    font-size: var(--text-xs);
+    color: var(--text-secondary);
+    white-space: nowrap;
+  }
+  th:first-child {
+    padding-left: var(--space-3);
+  }
+  .price-col {
+    text-align: right;
+  }
+  .actions-col {
+    text-align: right;
+  }
+  .sort-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    background: none;
+    border: none;
+    color: inherit;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 0;
+    transition: color var(--dur) var(--ease);
+  }
+  .sort-btn:hover {
+    color: var(--accent);
+  }
+  .sort-arrow {
+    font-size: 9px;
+    opacity: 0;
+    transition: opacity var(--dur) var(--ease);
+  }
+  .sort-arrow.visible {
+    opacity: 1;
+  }
+  .sort-arrow.desc {
+    transform: rotate(180deg);
+  }
+  tbody tr {
+    border-bottom: 1px solid var(--border);
+    transition: background var(--dur) var(--ease);
+    animation: dh-row-in 160ms var(--ease);
+  }
+  tbody tr:nth-child(even):not(.available):not(.error):not(.detail-row):not(.skeleton-row) {
+    background: color-mix(in srgb, var(--bg-sunken) 55%, transparent);
+  }
+  tbody tr:nth-child(even):not(.skeleton-row):hover {
+    background: var(--bg-sunken);
+  }
+  tbody tr:last-child {
+    border-bottom: none;
+  }
+  tbody tr:not(.skeleton-row):hover {
+    background: var(--bg-sunken);
+  }
+  tr.available {
+    background: var(--row-tint-available);
+    box-shadow: inset 2px 0 0 var(--green-solid);
+  }
+  tr.available:hover {
+    background: color-mix(in srgb, var(--row-tint-available) 60%, var(--bg-sunken));
+  }
+  tr.error {
+    background: var(--row-tint-error);
+    box-shadow: inset 2px 0 0 var(--red);
+  }
+  tr.error:hover {
+    background: color-mix(in srgb, var(--row-tint-error) 60%, var(--bg-sunken));
+  }
+
+  /* ---- Taken rows: the price budget is unactionable (the domain can't be
+     bought) — dim prices to a neutral tone and hide registrar badges and
+     promo/premium chips. Status badge and actions are kept. ---- */
+  tr.row-taken .price,
+  tr.row-taken .price-strike,
+  tr.row-taken .renew {
+    color: var(--text-tertiary) !important; /* overrides inline tier colors */
+  }
+  tr.row-taken .price-stack .reg-badge,
+  tr.row-taken .renew-line .reg-badge,
+  tr.row-taken .price-stack .chip-tag,
+  tr.row-taken .price-stack .coupon {
+    display: none;
+  }
+
+  /* ---- Pending-candidate skeleton rows (streaming runs). Name-less pulsing
+     bars standing in for candidates that have not reported yet; decorative
+     only (aria-hidden, pointer-events off). ---- */
+  tr.skeleton-row {
+    animation: none;
+    pointer-events: none;
+  }
+  .skel-bar {
+    display: block;
+    height: 10px;
+    border-radius: var(--radius-full);
+    background: var(--border-strong);
+    animation: dh-skel-pulse 1.2s var(--ease) infinite;
+  }
+  .skel-check {
+    width: 14px;
+    height: 14px;
+    border-radius: var(--radius-sm);
+  }
+  .skel-domain {
+    width: 160px;
+    max-width: 100%;
+  }
+  .skel-status {
+    width: 72px;
+  }
+  .skel-num {
+    width: 48px;
+    margin-left: auto;
+  }
+  .skel-action {
+    width: 64px;
+    margin-left: auto;
+  }
+  @keyframes dh-skel-pulse {
+    0%,
+    100% {
+      opacity: 0.4;
+    }
+    50% {
+      opacity: 0.85;
+    }
+  }
+
+  /* ---- Mobile: rows become stacked cards (no horizontal-scroll clipping).
+     Card backgrounds are OPAQUE (row tint mixed over --bg-elevated via
+     color-mix) so nothing bleeds through. ---- */
+  @media (max-width: 700px) {
+    thead {
+      display: none;
+    }
+    table {
+      display: block;
+      min-width: 0;
+    }
+    tbody {
+      display: block;
+      padding: var(--space-2);
+    }
+    tbody tr.row-in {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) minmax(0, max-content);
+      grid-template-areas:
+        'select domain price'
+        'select status renew'
+        'actions actions actions';
+      column-gap: var(--space-2);
+      row-gap: var(--space-1);
+      padding: var(--space-2) var(--space-3);
+      margin-bottom: var(--space-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      background: var(--bg-elevated);
+      box-shadow: var(--shadow-sm);
+    }
+    tbody tr.row-in:last-child {
+      border-bottom: 1px solid var(--border);
+    }
+    tbody tr.row-in:hover {
+      background: color-mix(in srgb, var(--bg-sunken) 70%, var(--bg-elevated));
+    }
+    tbody tr.row-in:nth-child(even):not(.available):not(.error):not(.detail-row) {
+      background: color-mix(in srgb, var(--bg-sunken) 55%, var(--bg-elevated));
+    }
+    tbody tr.row-in.available {
+      background: color-mix(in srgb, var(--green-solid) 5%, var(--bg-elevated));
+      box-shadow: var(--shadow-sm), inset 2px 0 0 var(--green-solid);
+    }
+    tbody tr.row-in.available:hover {
+      background: color-mix(in srgb, var(--green-solid) 9%, var(--bg-elevated));
+    }
+    tbody tr.row-in.error {
+      background: color-mix(in srgb, var(--red) 5%, var(--bg-elevated));
+      box-shadow: var(--shadow-sm), inset 2px 0 0 var(--red);
+    }
+    tbody tr.row-in.error:hover {
+      background: color-mix(in srgb, var(--red) 9%, var(--bg-elevated));
+    }
+    tbody tr.row-in > td {
+      padding: 0;
+      background: transparent;
+    }
+    /* Skeleton rows become simple cards with a check + name + status bar. */
+    tbody tr.skeleton-row {
+      display: flex;
+      align-items: center;
+      gap: var(--space-3);
+      padding: var(--space-3);
+      margin-bottom: var(--space-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      background: var(--bg-elevated);
+    }
+    tbody tr.skeleton-row > td {
+      padding: 0;
+      background: transparent;
+    }
+    tbody tr.skeleton-row td:nth-child(2) {
+      flex: 1;
+    }
+    /* Price/renewal/action bars are redundant in the narrow card. */
+    tbody tr.skeleton-row td:nth-child(n + 4) {
+      display: none;
+    }
+    .skel-domain {
+      width: 100%;
+    }
+    td.select-cell {
+      grid-area: select;
+      align-self: start;
+      padding-top: 2px;
+    }
+    td.domain-cell {
+      grid-area: domain;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+    /* Domain names scan faster in mono (DESIGN.md §3 mono rule). */
+    .domain-link,
+    .domain-text {
+      font-family: var(--font-mono, ui-monospace, Consolas, monospace);
+    }
+    td.status-cell {
+      grid-area: status;
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: var(--space-1);
+      white-space: normal;
+    }
+    td.price-cell {
+      grid-area: price;
+      align-self: start;
+      white-space: normal;
+    }
+    td.renew-cell {
+      grid-area: renew;
+      align-self: start;
+      white-space: normal;
+    }
+    td.actions-cell {
+      grid-area: actions;
+      display: flex;
+      justify-content: flex-end;
+      padding-top: var(--space-1);
+    }
+
+  }
+  td {
+    padding: var(--space-2) var(--space-3);
+    vertical-align: middle;
+  }
+  td:first-child {
+    padding-left: var(--space-3);
+  }
+  .price-cell {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .renew-col {
+    text-align: right;
+  }
+  .renew-cell {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .renew-line {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+  }
+  /* Renewal values are neutral in both themes — the red/amber/green tier
+     ramp belongs to the 1st-year column only. Taken rows still override to
+     tertiary via the tr.row-taken rule above. */
+  .renew {
+    font-weight: 500;
+    color: var(--text-secondary);
+  }
+  .price-stack {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 2px;
+  }
+  .domain-cell {
+    white-space: nowrap;
+  }
+  .domain-link {
+    color: var(--accent);
+    font-weight: 500;
+  }
+  .domain-text {
+    color: var(--text);
+    font-weight: 500;
+  }
+  .status-cell {
+    white-space: nowrap;
+  }
+  .price-line {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+  }
+  .price {
+    font-weight: 500;
+  }
+  .price-strike {
+    color: var(--text-tertiary);
+    text-decoration: line-through;
+    font-size: var(--text-xs);
+    font-weight: 400;
+  }
+
+  /* Shared .action-btn (+ :hover, :disabled, .active, svg) and .chip-tag
+     (+ variants) live in src/ui/chrome.css. */
+  .watch-refresh {
+    width: 32px;
+    height: 32px;
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
+    border: 1px solid var(--border);
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    border-radius: var(--radius-full);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: all var(--dur) var(--ease);
+  }
+  .watch-refresh:hover:not(:disabled) {
+    border-color: var(--border-strong);
+    color: var(--text);
+    background: var(--bg-sunken);
+  }
+  .watch-refresh:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .watch-refresh :global(svg) {
+    width: 14px;
+    height: 14px;
+  }
+  .watch-refresh :global(.spin) {
+    animation-duration: 1.5s;
+  }
+  .coupon {
+    display: inline-block;
+    font-size: 11px;
+    color: var(--text-tertiary);
+    /* Long coupon codes ellipsize instead of overflowing the cell at any width. */
+    max-width: 100%;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  :global([data-theme='dark']) .coupon {
+    color: var(--text-secondary);
+  }
+  .actions-cell {
+    text-align: right;
+  }
+  .actions {
+    display: inline-flex;
+    gap: var(--space-1);
+    justify-content: flex-end;
+    align-items: center;
+  }
+  /* Shared .action-btn lives in src/ui/chrome.css. */
+  .buy-btn {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+    background: var(--accent-soft);
+  }
+  .buy-placeholder {
+    visibility: hidden;
+  }
+  .buy-btn:hover {
+    color: var(--on-accent);
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  /* Shared .spin + @keyframes spin live in src/ui/chrome.css. */
+  .sentinel {
+    height: 1px;
+    width: 100%;
+  }
+
+  /* Ghost pill for meta-row bulk actions (premium-check, show-available):
+     transparent bg, strong border, secondary text; hover lifts text and
+     border to accent. No filled buttons in the meta row. */
+  .ghost-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: var(--space-1) var(--space-3);
+    border: 1px solid var(--border-strong);
+    background: transparent;
+    color: var(--text-secondary);
+    border-radius: var(--radius-full);
+    font-size: var(--text-xs);
+    font-weight: 500;
+    cursor: pointer;
+    min-height: 32px;
+    white-space: nowrap;
+    transition: all var(--dur) var(--ease);
+  }
+  .ghost-btn:hover:not(:disabled) {
+    color: var(--text);
+    border-color: var(--accent);
+  }
+  .ghost-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .ghost-btn.premium-check :global(svg) {
+    width: 14px;
+    height: 14px;
+    flex: none;
+  }
+  .search {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
+    padding: var(--space-1) var(--space-3);
+    font-size: var(--text-xs);
+    min-height: 32px;
+    background: var(--bg-elevated);
+    width: 180px;
+    color: var(--text);
+  }
+  .search:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .search-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+  }
+  .search-kbd {
+    position: absolute;
+    right: var(--space-2);
+    top: 50%;
+    transform: translateY(-50%);
+    font-family: var(--font-sans);
+    font-size: 10px;
+    line-height: 1;
+    padding: 2px 5px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-sunken);
+    color: var(--text-tertiary);
+    pointer-events: none;
+    user-select: none;
+  }
+
+  .budget-wrap {
+    display: inline-flex;
+    align-items: center;
+  }
+  .budget-input {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
+    padding: var(--space-1) var(--space-3);
+    font-size: var(--text-xs);
+    min-height: 32px;
+    background: var(--bg-elevated);
+    width: 90px;
+    color: var(--text);
+    text-align: right;
+  }
+  .budget-input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  /* Hide the number spinner for a cleaner pill look. */
+  .budget-input::-webkit-inner-spin-button,
+  .budget-input::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  .budget-input {
+    -moz-appearance: textfield;
+    appearance: textfield;
+  }
+
+  /* Quiet accent text-link for secondary bulk actions (select-all-matching,
+     copy-selected, copy-favorites) — must not outshout the primary CTA. */
+  .action-link {
+    display: inline-flex;
+    align-items: center;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--accent-text);
+    font-size: var(--text-xs);
+    font-weight: 500;
+    cursor: pointer;
+    min-height: 32px;
+    transition: color var(--dur) var(--ease);
+  }
+  .action-link:hover {
+    color: var(--accent-hover);
+    text-decoration: underline;
+  }
+  .fav-empty {
+    color: var(--text-tertiary);
+    font-size: var(--text-sm);
+    padding: var(--space-4) var(--space-3);
+    text-align: center;
+  }
+  input[type='checkbox'] {
+    accent-color: var(--accent);
+    width: 14px;
+    height: 14px;
+    cursor: pointer;
+  }
+  .select-cell {
+    width: 28px;
+    white-space: nowrap;
+  }
+
+</style>
